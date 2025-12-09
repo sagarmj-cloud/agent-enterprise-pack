@@ -19,9 +19,10 @@ steps:
     args:
       - "-c"
       - |
-        # Use provided version
-        PKG_VER="${_VERSION}"
-        echo "📦 Publishing version: $$PKG_VER"
+        # Use provided version (strip 'v' prefix if present)
+        RAW_VER="${_VERSION}"
+        PKG_VER=$${RAW_VER#v}
+        echo "📦 Publishing version: $$PKG_VER (from tag: $$RAW_VER)"
 
         # Update version in pyproject.toml
         sed -i "s/^version = .*/version = \"$$PKG_VER\"/" pyproject.toml
