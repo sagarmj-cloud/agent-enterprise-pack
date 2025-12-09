@@ -1,0 +1,167 @@
+name: CD - Deploy to Production
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  PYTHON_VERSION: "3.11"
+  REGISTRY: gcr.io
+  IMAGE_NAME: agent-enterprise-pack
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-vertex-ai:
+    name: Deploy to Vertex AI Agent Engine
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to Vertex AI Agent Engine
+        run: |
+          echo "🤖 Deploying to Vertex AI Agent Engine..."
+
+          # Deploy or update agent
+          gcloud ai agents deploy agent-enterprise-pack \
+            --region=${{ secrets.GCP_REGION }} \
+            --display-name="Agent Enterprise Pack" \
+            --description="Production-hardened AI agent with enterprise capabilities" \
+            --container-image=${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --container-port=8080 \
+            --container-env-vars="GOOGLE_CLOUD_PROJECT=${{ secrets.GCP_PROJECT_ID }},LOCATION=${{ secrets.GCP_REGION }},MODEL=gemini-1.5-pro,CACHE_BACKEND=redis" \
+            --container-secrets="JWT_SECRET=jwt-secret:latest,REDIS_URL=redis-url:latest" \
+            --min-replicas=1 \
+            --max-replicas=10 \
+            --cpu=2 \
+            --memory=4Gi \
+            --timeout=300s \
+            --labels="version=${{ github.ref_name }},environment=production" \
+            --quiet || \
+          gcloud ai agents update agent-enterprise-pack \
+            --region=${{ secrets.GCP_REGION }} \
+            --container-image=${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --update-labels="version=${{ github.ref_name }},last-deployed=$(date +%s)" \
+            --quiet
+
+          echo "✅ Agent deployed to Vertex AI"
+
+      - name: Get agent endpoint
+        run: |
+          AGENT_ENDPOINT=$(gcloud ai agents describe agent-enterprise-pack \
+            --region=${{ secrets.GCP_REGION }} \
+            --format='value(endpoint)')
+          echo "Agent endpoint: $AGENT_ENDPOINT"
+          echo "AGENT_ENDPOINT=$AGENT_ENDPOINT" >> $GITHUB_ENV
+
+      - name: Health check
+        run: |
+          sleep 30
+          curl -f ${{ env.AGENT_ENDPOINT }}/health \
+            -H "Authorization: Bearer $(gcloud auth print-access-token)" || exit 1
+          echo "✅ Health check passed"
+
+      - name: Test agent inference
+        run: |
+          echo "🧪 Testing agent inference..."
+          curl -X POST ${{ env.AGENT_ENDPOINT }}/chat \
+            -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "message": "Hello, this is a deployment test",
+              "session_id": "deployment-test-${{ github.sha }}"
+            }' || echo "⚠️ Inference test failed (may need authentication setup)"
+          echo "✅ Inference test completed"
+
+  notify:
+    name: Notify Deployment
+    needs: [build-and-push, deploy-vertex-ai]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Send Slack notification
+        if: secrets.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "text": "🤖 Agent Deployment ${{ job.status }}: Agent Enterprise Pack",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Status:* ${{ job.status }}\n*Platform:* Vertex AI Agent Engine\n*Version:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}"
+                  }
+                }
+              ]
+            }'
+

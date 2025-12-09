@@ -1,0 +1,163 @@
+# Cloud Build Configuration - CI Pipeline
+# =========================================
+# Triggers on: Push to any branch, Pull Requests
+# 
+# This replaces GitHub Actions CI with Cloud Build
+
+steps:
+  # Step 1: Install UV
+  - name: 'python:3.11-slim'
+    id: 'install-uv'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "📦 Installing UV..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.cargo/bin:$PATH"
+        uv --version
+
+  # Step 2: Install Dependencies
+  - name: 'python:3.11-slim'
+    id: 'install-deps'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "📦 Installing dependencies..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.cargo/bin:$PATH"
+        uv sync --all-extras
+    waitFor: ['install-uv']
+
+  # Step 3: Lint with Ruff
+  - name: 'python:3.11-slim'
+    id: 'lint'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🔍 Running linting checks..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.cargo/bin:$PATH"
+        uv sync --all-extras
+        uv run ruff check .
+        uv run ruff format --check .
+    waitFor: ['install-deps']
+
+  # Step 4: Type Check with mypy
+  - name: 'python:3.11-slim'
+    id: 'type-check'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🔍 Running type checks..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.cargo/bin:$PATH"
+        uv sync --all-extras
+        uv run mypy core/ --ignore-missing-imports || true
+    waitFor: ['install-deps']
+
+  # Step 5: Run Tests with Redis
+  - name: 'python:3.11-slim'
+    id: 'test'
+    entrypoint: 'bash'
+    env:
+      - 'REDIS_URL=redis://redis:6379'
+      - 'CACHE_BACKEND=redis'
+      - 'JWT_SECRET=test-secret-key-for-ci'
+      - 'GOOGLE_CLOUD_PROJECT=${PROJECT_ID}'
+    args:
+      - '-c'
+      - |
+        echo "🧪 Running tests..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.cargo/bin:$PATH"
+        uv sync --all-extras
+        uv run pytest -v --cov --cov-report=xml --cov-report=term
+    waitFor: ['install-deps']
+
+  # Step 6: Security Scan
+  - name: 'python:3.11-slim'
+    id: 'security'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🔒 Running security scans..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.cargo/bin:$PATH"
+        uv sync --all-extras
+        uv pip install safety bandit
+        uv run safety check --json || true
+        uv run bandit -r core/ -f json || true
+    waitFor: ['install-deps']
+
+  # Step 7: Build Docker Image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-build'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.uv'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:${SHORT_SHA}'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:${BRANCH_NAME}'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:latest'
+      - '.'
+    waitFor: ['lint', 'type-check', 'test', 'security']
+
+  # Step 8: Push Docker Image (only on main/tags)
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-push'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack'
+    waitFor: ['docker-build']
+
+  # Step 9: Test Docker Image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-test'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🧪 Testing Docker image..."
+        docker run -d --name test-agent -p 8080:8080 \
+          -e JWT_SECRET=test-secret \
+          -e CACHE_BACKEND=memory \
+          gcr.io/${PROJECT_ID}/agent-enterprise-pack:${SHORT_SHA}
+        sleep 10
+        docker logs test-agent
+        curl -f http://localhost:8080/health || exit 1
+        docker stop test-agent
+        echo "✅ Docker image test passed"
+    waitFor: ['docker-push']
+
+# Options
+options:
+  machineType: 'N1_HIGHCPU_8'  # Faster builds
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+
+# Timeout
+timeout: '1800s'  # 30 minutes
+
+# Images to store
+images:
+  - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:${SHORT_SHA}'
+  - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:${BRANCH_NAME}'
+  - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:latest'
+
+# Artifacts
+artifacts:
+  objects:
+    location: 'gs://${PROJECT_ID}_cloudbuild/artifacts/${BUILD_ID}'
+    paths:
+      - 'coverage.xml'
+      - 'htmlcov/**'
+

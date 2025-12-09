@@ -1,0 +1,120 @@
+# Cloud Build Configuration - CD Pipeline
+# =========================================
+# Triggers on: Tags matching v*.*.*
+# 
+# This replaces GitHub Actions CD with Cloud Build
+
+steps:
+  # Step 1: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-cloud-run'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🚀 Deploying to Cloud Run..."
+        
+        gcloud run deploy agent-enterprise-pack \
+          --image=gcr.io/${PROJECT_ID}/agent-enterprise-pack:${TAG_NAME} \
+          --platform=managed \
+          --region=${_DEPLOY_REGION} \
+          --allow-unauthenticated \
+          --set-env-vars="CACHE_BACKEND=redis,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},LOCATION=${_DEPLOY_REGION},MODEL=gemini-1.5-pro" \
+          --set-secrets="JWT_SECRET=jwt-secret:latest,REDIS_URL=redis-url:latest" \
+          --memory=2Gi \
+          --cpu=2 \
+          --timeout=300 \
+          --concurrency=80 \
+          --min-instances=1 \
+          --max-instances=10 \
+          --service-account=${_SERVICE_ACCOUNT} \
+          --quiet
+
+  # Step 2: Get Service URL
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'get-url'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        SERVICE_URL=$(gcloud run services describe agent-enterprise-pack \
+          --platform=managed \
+          --region=${_DEPLOY_REGION} \
+          --format='value(status.url)')
+        echo "Service URL: $SERVICE_URL"
+        echo "$SERVICE_URL" > /workspace/service_url.txt
+
+  # Step 3: Health Check
+  - name: 'gcr.io/cloud-builders/curl'
+    id: 'health-check'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🏥 Running health check..."
+        SERVICE_URL=$(cat /workspace/service_url.txt)
+        sleep 30
+        
+        for i in {1..5}; do
+          if curl -f "$SERVICE_URL/health"; then
+            echo "✅ Health check passed"
+            exit 0
+          fi
+          echo "Attempt $i failed, retrying..."
+          sleep 10
+        done
+        
+        echo "❌ Health check failed"
+        exit 1
+    waitFor: ['get-url']
+
+  # Step 4: Send Slack Notification (optional)
+  - name: 'gcr.io/cloud-builders/curl'
+    id: 'notify-slack'
+    entrypoint: 'bash'
+    secretEnv: ['SLACK_WEBHOOK_URL']
+    args:
+      - '-c'
+      - |
+        if [ -n "$$SLACK_WEBHOOK_URL" ]; then
+          SERVICE_URL=$(cat /workspace/service_url.txt)
+          curl -X POST $$SLACK_WEBHOOK_URL \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"text\": \"🚀 Deployment Successful\",
+              \"blocks\": [
+                {
+                  \"type\": \"section\",
+                  \"text\": {
+                    \"type\": \"mrkdwn\",
+                    \"text\": \"*Deployment Status:* ✅ Success\\n*Version:* ${TAG_NAME}\\n*Service:* $SERVICE_URL\\n*Project:* ${PROJECT_ID}\"
+                  }
+                }
+              ]
+            }"
+          echo "✅ Slack notification sent"
+        else
+          echo "⚠️  SLACK_WEBHOOK_URL not configured, skipping notification"
+        fi
+    waitFor: ['health-check']
+
+# Substitutions (default values)
+substitutions:
+  _DEPLOY_REGION: 'us-central1'
+  _SERVICE_ACCOUNT: '${PROJECT_NUMBER}-compute@developer.gserviceaccount.com'
+
+# Available secrets from Secret Manager
+availableSecrets:
+  secretManager:
+    - versionName: projects/${PROJECT_ID}/secrets/slack-webhook/versions/latest
+      env: 'SLACK_WEBHOOK_URL'
+
+# Options
+options:
+  machineType: 'N1_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+
+# Timeout
+timeout: '1200s'  # 20 minutes
+

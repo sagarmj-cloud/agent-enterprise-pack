@@ -1,0 +1,42 @@
+# Agent Enterprise Pack - Requirements
+# =====================================
+# Updated: December 4, 2025
+# Latest stable versions of all dependencies compatible with google-adk 1.20.0
+
+# Core dependencies
+# Note: fastapi version constrained by google-adk 1.20.0 requirement: >=0.115.0,<0.119.0
+fastapi>=0.115.0,<0.119.0
+uvicorn>=0.38.0
+pydantic>=2.12.0
+httpx>=0.28.0
+
+# Google Cloud / ADK
+google-adk>=1.20.0
+google-cloud-aiplatform>=1.129.0
+google-auth>=2.43.0
+
+# Security
+PyJWT>=2.10.0
+cryptography>=46.0.0
+
+# Caching
+redis>=7.1.0
+
+# Observability
+opentelemetry-api>=1.37.0
+opentelemetry-sdk>=1.37.0
+opentelemetry-instrumentation-fastapi>=0.58b0
+opentelemetry-exporter-gcp-trace>=1.11.0
+google-cloud-monitoring>=2.28.0
+
+# Optional: Token counting
+tiktoken>=0.12.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+locust>=2.15.0
+
+# Development
+python-dotenv>=1.2.0

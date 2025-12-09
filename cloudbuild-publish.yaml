@@ -1,0 +1,142 @@
+# Cloud Build - Publish to Artifact Registry
+# Triggered on git tags: v*.*.*
+#
+# Usage:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+#   → Automatically publishes to Artifact Registry
+#
+# Manual trigger:
+#   gcloud builds submit --config=cloudbuild-publish.yaml \
+#     --substitutions=_VERSION=1.0.0 \
+#     --project=agent-test-1764790376
+
+steps:
+  # Step 1: Extract version from tag and update pyproject.toml
+  - name: "python:3.12-slim"
+    id: "prepare-version"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        # Use provided version
+        PKG_VER="${_VERSION}"
+        echo "📦 Publishing version: $$PKG_VER"
+
+        # Update version in pyproject.toml
+        sed -i "s/^version = .*/version = \"$$PKG_VER\"/" pyproject.toml
+
+        # Verify
+        grep "^version" pyproject.toml
+
+        # Save version for later steps
+        echo "$$PKG_VER" > /workspace/version.txt
+
+  # Step 2: Run tests before publishing
+  - name: "python:3.12-slim"
+    id: "run-tests"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        pip install --quiet pytest pytest-asyncio pytest-mock pytest-cov
+        pip install --quiet -e .
+
+        echo "🧪 Running tests..."
+        # Override pyproject.toml addopts
+        pytest tests/ -v --tb=short -x --override-ini="addopts=" || {
+          echo "❌ Tests failed! Aborting publish."
+          exit 1
+        }
+        echo "✅ Tests passed!"
+
+  # Step 3: Build the package
+  - name: "python:3.12-slim"
+    id: "build-package"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        pip install --quiet build twine
+        
+        echo "📦 Building package..."
+        python -m build
+        
+        echo "📋 Built artifacts:"
+        ls -la dist/
+
+  # Step 4: Upload to Artifact Registry
+  - name: "python:3.12-slim"
+    id: "publish-to-artifact-registry"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        pip install --quiet twine keyrings.google-artifactregistry-auth
+
+        PKG_VER=$$(cat /workspace/version.txt)
+        REPO_URL="https://us-central1-python.pkg.dev/${PROJECT_ID}/python-packages/"
+
+        echo "🚀 Publishing to Artifact Registry..."
+        echo "   Repository: $$REPO_URL"
+        echo "   Version: $$PKG_VER"
+
+        python -m twine upload \
+          --repository-url "$$REPO_URL" \
+          --verbose \
+          dist/*
+
+        echo ""
+        echo "✅ Published agent-enterprise-pack==$$PKG_VER"
+        echo ""
+        echo "📋 Install with:"
+        echo "   pip install agent-enterprise-pack==$$PKG_VER \\"
+        echo "     --index-url https://us-central1-python.pkg.dev/${PROJECT_ID}/python-packages/simple/"
+
+  # Step 5: Create release record in Firestore
+  - name: "python:3.12-slim"
+    id: "record-release"
+    entrypoint: "bash"
+    env:
+      - "PKG_VERSION=${_VERSION}"
+      - "PKG_COMMIT_SHA=${_COMMIT_SHA}"
+    args:
+      - "-c"
+      - |
+        pip install --quiet google-cloud-firestore
+
+        python << PYEOF
+        import os
+        from google.cloud import firestore
+        from datetime import datetime, timezone
+
+        version = os.environ["PKG_VERSION"]
+        commit_sha = os.environ["PKG_COMMIT_SHA"]
+
+        db = firestore.Client(project="${PROJECT_ID}")
+
+        # Record release
+        db.collection("package-releases").document("agent-enterprise-pack").collection("versions").document(version).set({
+            "version": version,
+            "published_at": datetime.now(timezone.utc),
+            "commit_sha": commit_sha,
+        })
+
+        # Update latest pointer
+        db.collection("package-releases").document("agent-enterprise-pack").set({
+            "latest_version": version,
+            "updated_at": datetime.now(timezone.utc),
+        }, merge=True)
+
+        print(f"✅ Recorded release: agent-enterprise-pack=={version}")
+        PYEOF
+
+substitutions:
+  _VERSION: "1.0.0"
+  _COMMIT_SHA: "manual"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: "600s"
+

@@ -1,0 +1,40 @@
+# Cloud Build Configuration - Build Docker Image Only
+# =====================================================
+# Simple configuration to just build and push the Docker image
+# 
+# Usage:
+#   gcloud builds submit --config=cloudbuild-build-only.yaml
+
+steps:
+  # Build Docker Image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-build'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.uv'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:${TAG_NAME}'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:latest'
+      - '.'
+
+# Images to push to Container Registry
+images:
+  - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:${TAG_NAME}'
+  - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:latest'
+
+# Build options
+options:
+  machineType: 'N1_HIGHCPU_8'  # Fast build machine
+  diskSizeGb: 50
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+
+# Timeout (10 minutes should be enough)
+timeout: '600s'
+
+# Substitutions (defaults)
+substitutions:
+  TAG_NAME: 'latest'
+

@@ -1,0 +1,73 @@
+# Agent Enterprise Pack - Dockerfile with UV
+# ===========================================
+# Multi-stage build using UV for faster dependency installation
+
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS builder
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency files
+COPY pyproject.toml .
+COPY requirements.txt .
+
+# Install dependencies with UV (much faster than pip)
+RUN uv pip install --system -r requirements.txt
+
+# Copy application code
+COPY core/ ./core/
+COPY main.py .
+COPY examples/ ./examples/
+
+# =============================================================================
+# Runtime stage
+# =============================================================================
+
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH"
+
+# Set working directory
+WORKDIR /app
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed dependencies and application from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /app /app
+
+# Create non-root user
+RUN useradd -m -u 1000 agent && \
+    chown -R agent:agent /app
+
+USER agent
+
+# Expose port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Run application
+CMD ["python", "main.py"]
+

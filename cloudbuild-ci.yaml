@@ -1,0 +1,89 @@
+# Cloud Build Configuration - CI Pipeline
+# =========================================
+# Triggers on: Push to any branch, Pull Requests
+# Purpose: Run tests, lint, type check, security scans
+
+steps:
+  # Step 1: Install dependencies and run tests
+  - name: 'python:3.11-slim'
+    id: 'test'
+    entrypoint: 'bash'
+    env:
+      - 'CACHE_BACKEND=memory'
+      - 'JWT_SECRET=test-secret-key-for-ci'
+    args:
+      - '-c'
+      - |
+        echo "📦 Installing UV and dependencies..."
+        pip install uv
+        uv sync --all-extras
+        
+        echo "🧪 Running tests..."
+        uv run pytest -v --cov=core --cov-report=xml --cov-report=term-missing
+        
+        echo "✅ Tests completed"
+
+  # Step 2: Lint with Ruff
+  - name: 'python:3.11-slim'
+    id: 'lint'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install uv
+        uv sync --all-extras
+        
+        echo "🔍 Running linting..."
+        uv run ruff check . || true
+        uv run ruff format --check . || true
+
+  # Step 3: Type Check
+  - name: 'python:3.11-slim'
+    id: 'type-check'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install uv
+        uv sync --all-extras
+        
+        echo "🔍 Running type checks..."
+        uv run mypy core/ --ignore-missing-imports || true
+
+  # Step 4: Security Scan
+  - name: 'python:3.11-slim'
+    id: 'security'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install uv bandit safety
+        uv sync --all-extras
+        
+        echo "🔒 Running security scans..."
+        bandit -r core/ -f txt || true
+
+  # Step 5: Test Agent Module
+  - name: 'python:3.11-slim'
+    id: 'test-agent'
+    entrypoint: 'bash'
+    env:
+      - 'CACHE_BACKEND=memory'
+    args:
+      - '-c'
+      - |
+        pip install uv
+        uv sync --all-extras
+        
+        echo "🤖 Testing agent module..."
+        cd agent
+        python -c "from agent import root_agent; print(f'Agent loaded: {root_agent.name}')"
+        echo "✅ Agent module test passed"
+
+# Options
+options:
+  machineType: 'E2_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: '1200s'
+

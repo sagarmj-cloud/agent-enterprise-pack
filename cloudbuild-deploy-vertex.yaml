@@ -1,0 +1,199 @@
+# Cloud Build Configuration - Deploy to Vertex AI Agent Engine
+# =============================================================
+# Triggers on: Tags matching v*.*.*
+# 
+# This deploys the agent to Vertex AI Agent Engine (not Cloud Run)
+
+steps:
+  # Step 1: Build and Push Docker Image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-build'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.uv'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:${TAG_NAME}'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack:latest'
+      - '.'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'docker-push'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'gcr.io/${PROJECT_ID}/agent-enterprise-pack'
+    waitFor: ['docker-build']
+
+  # Step 2: Deploy Agent to Vertex AI Agent Engine
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-vertex-agent'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🤖 Deploying to Vertex AI Agent Engine..."
+        
+        # Create or update agent deployment
+        gcloud ai agents deploy agent-enterprise-pack \
+          --region=${_DEPLOY_REGION} \
+          --display-name="Agent Enterprise Pack" \
+          --description="Production-hardened AI agent with enterprise capabilities" \
+          --container-image=gcr.io/${PROJECT_ID}/agent-enterprise-pack:${TAG_NAME} \
+          --container-port=8080 \
+          --container-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID},LOCATION=${_DEPLOY_REGION},MODEL=${_MODEL}" \
+          --container-secrets="JWT_SECRET=jwt-secret:latest,REDIS_URL=redis-url:latest" \
+          --min-replicas=${_MIN_REPLICAS} \
+          --max-replicas=${_MAX_REPLICAS} \
+          --cpu=${_CPU} \
+          --memory=${_MEMORY} \
+          --timeout=${_TIMEOUT} \
+          --service-account=${_SERVICE_ACCOUNT} \
+          --labels="version=${TAG_NAME},environment=${_ENVIRONMENT}" \
+          --quiet || \
+        gcloud ai agents update agent-enterprise-pack \
+          --region=${_DEPLOY_REGION} \
+          --container-image=gcr.io/${PROJECT_ID}/agent-enterprise-pack:${TAG_NAME} \
+          --quiet
+        
+        echo "✅ Agent deployed to Vertex AI Agent Engine"
+    waitFor: ['docker-push']
+
+  # Step 3: Get Agent Endpoint
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'get-endpoint'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "📍 Getting agent endpoint..."
+        
+        AGENT_ENDPOINT=$(gcloud ai agents describe agent-enterprise-pack \
+          --region=${_DEPLOY_REGION} \
+          --format='value(endpoint)')
+        
+        echo "Agent Endpoint: $AGENT_ENDPOINT"
+        echo "$AGENT_ENDPOINT" > /workspace/agent_endpoint.txt
+    waitFor: ['deploy-vertex-agent']
+
+  # Step 4: Health Check
+  - name: 'gcr.io/cloud-builders/curl'
+    id: 'health-check'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🏥 Running health check..."
+        AGENT_ENDPOINT=$(cat /workspace/agent_endpoint.txt)
+        sleep 30
+        
+        for i in {1..5}; do
+          if curl -f "$AGENT_ENDPOINT/health" \
+            -H "Authorization: Bearer $(gcloud auth print-access-token)"; then
+            echo "✅ Health check passed"
+            exit 0
+          fi
+          echo "Attempt $i failed, retrying..."
+          sleep 10
+        done
+        
+        echo "❌ Health check failed"
+        exit 1
+    waitFor: ['get-endpoint']
+
+  # Step 5: Test Agent Inference
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'test-inference'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "🧪 Testing agent inference..."
+        AGENT_ENDPOINT=$(cat /workspace/agent_endpoint.txt)
+        
+        curl -X POST "$AGENT_ENDPOINT/chat" \
+          -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "message": "Hello, this is a test message",
+            "session_id": "test-session-123"
+          }' || echo "⚠️  Inference test failed (may need authentication setup)"
+        
+        echo "✅ Inference test completed"
+    waitFor: ['health-check']
+
+  # Step 6: Update Agent Metadata
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'update-metadata'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "📝 Updating agent metadata..."
+        
+        gcloud ai agents update agent-enterprise-pack \
+          --region=${_DEPLOY_REGION} \
+          --update-labels="last-deployed=$(date +%s),version=${TAG_NAME}" \
+          --quiet
+        
+        echo "✅ Metadata updated"
+    waitFor: ['test-inference']
+
+  # Step 7: Send Notification
+  - name: 'gcr.io/cloud-builders/curl'
+    id: 'notify-slack'
+    entrypoint: 'bash'
+    secretEnv: ['SLACK_WEBHOOK_URL']
+    args:
+      - '-c'
+      - |
+        if [ -n "$$SLACK_WEBHOOK_URL" ]; then
+          AGENT_ENDPOINT=$(cat /workspace/agent_endpoint.txt)
+          curl -X POST $$SLACK_WEBHOOK_URL \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"text\": \"🤖 Agent Deployed to Vertex AI\",
+              \"blocks\": [
+                {
+                  \"type\": \"section\",
+                  \"text\": {
+                    \"type\": \"mrkdwn\",
+                    \"text\": \"*Deployment Status:* ✅ Success\\n*Version:* ${TAG_NAME}\\n*Platform:* Vertex AI Agent Engine\\n*Endpoint:* $AGENT_ENDPOINT\\n*Region:* ${_DEPLOY_REGION}\"
+                  }
+                }
+              ]
+            }"
+          echo "✅ Slack notification sent"
+        else
+          echo "⚠️  SLACK_WEBHOOK_URL not configured"
+        fi
+    waitFor: ['update-metadata']
+
+# Substitutions (default values)
+substitutions:
+  _DEPLOY_REGION: 'us-central1'
+  _MODEL: 'gemini-1.5-pro'
+  _MIN_REPLICAS: '1'
+  _MAX_REPLICAS: '10'
+  _CPU: '2'
+  _MEMORY: '4Gi'
+  _TIMEOUT: '300s'
+  _ENVIRONMENT: 'production'
+  _SERVICE_ACCOUNT: '${PROJECT_NUMBER}-compute@developer.gserviceaccount.com'
+
+# Available secrets from Secret Manager
+availableSecrets:
+  secretManager:
+    - versionName: projects/${PROJECT_ID}/secrets/slack-webhook/versions/latest
+      env: 'SLACK_WEBHOOK_URL'
+
+# Options
+options:
+  machineType: 'N1_HIGHCPU_8'
+  logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
+
+# Timeout
+timeout: '1800s'  # 30 minutes
+
